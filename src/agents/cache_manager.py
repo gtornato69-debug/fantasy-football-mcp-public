@@ -7,9 +7,12 @@ persistence, TTL management, and cache invalidation strategies.
 """
 
 import asyncio
+import base64
 import json
-import pickle
+import os
+import tempfile
 from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple, Protocol, runtime_checkable
 from dataclasses import dataclass, field
@@ -22,10 +25,56 @@ from abc import ABC, abstractmethod
 
 import aiocache
 from aiocache import SimpleMemoryCache, Cache
-from aiocache.serializers import PickleSerializer, JsonSerializer
+from aiocache.serializers import NullSerializer
 from loguru import logger
 
 from config.settings import Settings
+
+
+CACHE_FORMAT_VERSION = 2
+MAX_CACHE_FILE_BYTES = 10 * 1024 * 1024
+
+
+def _json_default(value: Any) -> Dict[str, Any]:
+    """Encode the small, explicit set of non-JSON cache value types."""
+
+    if isinstance(value, datetime):
+        return {"__cache_type__": "datetime", "value": value.isoformat()}
+    if isinstance(value, timedelta):
+        return {"__cache_type__": "timedelta", "seconds": value.total_seconds()}
+    if isinstance(value, Decimal):
+        return {"__cache_type__": "decimal", "value": str(value)}
+    if isinstance(value, Path):
+        return {"__cache_type__": "path", "value": str(value)}
+    if isinstance(value, bytes):
+        return {
+            "__cache_type__": "bytes",
+            "value": base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, (set, frozenset)):
+        return {"__cache_type__": "set", "items": sorted(value, key=repr)}
+    raise TypeError(f"Unsupported cache value type: {type(value).__name__}")
+
+
+def _json_object_hook(value: Dict[str, Any]) -> Any:
+    """Decode only explicitly supported tags; never import or execute classes."""
+
+    kind = value.get("__cache_type__")
+    if kind is None:
+        return value
+    if kind == "datetime" and set(value) == {"__cache_type__", "value"}:
+        return datetime.fromisoformat(value["value"])
+    if kind == "timedelta" and set(value) == {"__cache_type__", "seconds"}:
+        return timedelta(seconds=float(value["seconds"]))
+    if kind == "decimal" and set(value) == {"__cache_type__", "value"}:
+        return Decimal(value["value"])
+    if kind == "path" and set(value) == {"__cache_type__", "value"}:
+        return Path(value["value"])
+    if kind == "bytes" and set(value) == {"__cache_type__", "value"}:
+        return base64.b64decode(value["value"], validate=True)
+    if kind == "set" and set(value) == {"__cache_type__", "items"}:
+        return set(value["items"])
+    raise ValueError(f"Unsupported or malformed cache type tag: {kind!r}")
 
 
 class CacheStrategy(str, Enum):
@@ -169,12 +218,14 @@ class CacheManagerAgent:
 
         # Setup cache directories
         self.cache_dir = settings.cache_dir
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.cache_dir.chmod(0o700)
 
         # Initialize caches
         self._memory_cache: Optional[Cache] = None
         self._file_cache_path = self.cache_dir / "file_cache"
-        self._file_cache_path.mkdir(exist_ok=True)
+        self._file_cache_path.mkdir(exist_ok=True, mode=0o700)
+        self._file_cache_path.chmod(0o700)
 
         # Cache entries tracking with LRU support
         self._entries: Dict[str, CacheEntry] = {}
@@ -208,8 +259,12 @@ class CacheManagerAgent:
         try:
             # Initialize memory cache
             self._memory_cache = SimpleMemoryCache(
-                serializer=PickleSerializer(), namespace="yahoo_fantasy_football"
+                serializer=NullSerializer(), namespace="yahoo_fantasy_football"
             )
+
+            # Pickle can execute code while loading. Never deserialize legacy
+            # entries; quarantine them so the cache can rebuild from source data.
+            self._quarantine_legacy_cache_files()
 
             # Load existing file cache entries
             await self._load_file_cache_index()
@@ -768,18 +823,21 @@ class CacheManagerAgent:
             if not entry or entry.is_expired():
                 return None
 
-            cache_file = self._file_cache_path / f"{self._hash_key(key)}.pkl"
+            cache_file = self._file_cache_path / f"{self._hash_key(key)}.json"
             if cache_file.exists():
-                with open(cache_file, "rb") as f:
-                    cached_entry = pickle.load(f)
-                    if not cached_entry.is_expired():
-                        cached_entry.touch()
-                        return cached_entry.value
-                    else:
-                        # Clean up expired file
-                        cache_file.unlink()
-                        if key in self._entries:
-                            del self._entries[key]
+                if cache_file.stat().st_size > MAX_CACHE_FILE_BYTES:
+                    raise ValueError("Cache entry exceeds the maximum file size")
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    payload = json.load(f, object_hook=_json_object_hook)
+                cached_entry = self._entry_from_payload(payload, expected_key=key)
+                if not cached_entry.is_expired():
+                    cached_entry.touch()
+                    return cached_entry.value
+
+                # Clean up expired file
+                cache_file.unlink()
+                if key in self._entries:
+                    del self._entries[key]
 
             return None
 
@@ -790,9 +848,33 @@ class CacheManagerAgent:
     async def _set_in_file_cache(self, key: str, entry: CacheEntry) -> bool:
         """Set value in file cache."""
         try:
-            cache_file = self._file_cache_path / f"{self._hash_key(key)}.pkl"
-            with open(cache_file, "wb") as f:
-                pickle.dump(entry, f)
+            cache_file = self._file_cache_path / f"{self._hash_key(key)}.json"
+            encoded = json.dumps(
+                self._entry_to_payload(entry),
+                default=_json_default,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(encoded) > MAX_CACHE_FILE_BYTES:
+                raise ValueError("Cache entry exceeds the maximum file size")
+
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{cache_file.name}.", dir=self._file_cache_path
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(encoded)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_name, cache_file)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                Path(temp_name).unlink(missing_ok=True)
+                raise
             return True
 
         except Exception as e:
@@ -802,7 +884,7 @@ class CacheManagerAgent:
     async def _delete_from_file_cache(self, key: str) -> bool:
         """Delete value from file cache."""
         try:
-            cache_file = self._file_cache_path / f"{self._hash_key(key)}.pkl"
+            cache_file = self._file_cache_path / f"{self._hash_key(key)}.json"
             if cache_file.exists():
                 cache_file.unlink()
                 return True
@@ -811,6 +893,67 @@ class CacheManagerAgent:
         except Exception as e:
             logger.error(f"Error deleting from file cache for key {key}: {e}")
             return False
+
+    @staticmethod
+    def _entry_to_payload(entry: CacheEntry) -> Dict[str, Any]:
+        return {
+            "format_version": CACHE_FORMAT_VERSION,
+            "key": entry.key,
+            "value": entry.value,
+            "created_at": entry.created_at.isoformat(),
+            "expires_at": entry.expires_at.isoformat() if entry.expires_at else None,
+            "access_count": entry.access_count,
+            "last_accessed": (
+                entry.last_accessed.isoformat() if entry.last_accessed else None
+            ),
+            "tags": entry.tags,
+            "size_bytes": entry.size_bytes,
+            "priority": entry.priority,
+        }
+
+    @staticmethod
+    def _entry_from_payload(payload: Any, *, expected_key: str) -> CacheEntry:
+        if not isinstance(payload, dict) or payload.get("format_version") != CACHE_FORMAT_VERSION:
+            raise ValueError("Unsupported cache entry format")
+        if payload.get("key") != expected_key:
+            raise ValueError("Cache entry key does not match its index")
+        tags = payload.get("tags", [])
+        if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+            raise ValueError("Cache entry tags must be strings")
+        return CacheEntry(
+            key=expected_key,
+            value=payload.get("value"),
+            created_at=datetime.fromisoformat(payload["created_at"]),
+            expires_at=(
+                datetime.fromisoformat(payload["expires_at"])
+                if payload.get("expires_at")
+                else None
+            ),
+            access_count=int(payload.get("access_count", 0)),
+            last_accessed=(
+                datetime.fromisoformat(payload["last_accessed"])
+                if payload.get("last_accessed")
+                else None
+            ),
+            tags=tags,
+            size_bytes=int(payload.get("size_bytes", 0)),
+            priority=int(payload.get("priority", 0)),
+        )
+
+    def _quarantine_legacy_cache_files(self) -> None:
+        """Rename legacy pickle files without reading their contents."""
+
+        for legacy_file in self._file_cache_path.glob("*.pkl"):
+            destination = legacy_file.with_suffix(legacy_file.suffix + ".disabled")
+            counter = 1
+            while destination.exists():
+                destination = legacy_file.with_suffix(
+                    legacy_file.suffix + f".disabled.{counter}"
+                )
+                counter += 1
+            legacy_file.replace(destination)
+            destination.chmod(0o600)
+            logger.warning("Quarantined legacy pickle cache entry: {}", legacy_file.name)
 
     async def _load_file_cache_index(self) -> None:
         """Load file cache index from disk."""
@@ -938,20 +1081,11 @@ class CacheManagerAgent:
 
     def _estimate_size(self, value: Any) -> int:
         """Estimate size of value in bytes."""
-        try:
-            return len(pickle.dumps(value))
-        except Exception:
-            # Fallback estimation
-            if isinstance(value, str):
-                return len(value.encode("utf-8"))
-            elif isinstance(value, (int, float)):
-                return 8
-            elif isinstance(value, bool):
-                return 1
-            elif isinstance(value, (list, dict)):
-                return len(str(value))
-            else:
-                return 100  # Default estimate
+        return len(
+            json.dumps(value, default=_json_default, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
 
     async def _enforce_memory_limits(self, new_entry_size: int = 0) -> None:
         """
