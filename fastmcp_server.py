@@ -11,9 +11,11 @@ import json
 import os
 from collections.abc import Iterable
 from dataclasses import asdict, is_dataclass
-from typing import Any, Awaitable, Callable, Dict, Literal, Optional, Sequence, Union
+from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Sequence, Union
 
 from fastmcp import Context, FastMCP
+from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.dependencies import get_access_token
 from mcp.types import ContentBlock, TextContent
 
 import fantasy_football_multi_league
@@ -24,6 +26,77 @@ import fantasy_football_multi_league
 _legacy_call_tool = fantasy_football_multi_league.call_tool
 _legacy_refresh_token = fantasy_football_multi_league.refresh_yahoo_token
 
+READ_SCOPE = "fantasy:read"
+ADMIN_SCOPE = "fantasy:admin"
+
+
+def _split_csv(value: str | None) -> list[str]:
+    """Return trimmed, non-empty comma-separated values."""
+
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def _build_auth_provider(env: Mapping[str, str] | None = None) -> JWTVerifier | None:
+    """Build the JWT verifier when authentication is configured.
+
+    Public HTTP startup is refused unless this returns a verifier. Local-only
+    development remains available without an identity provider.
+    """
+
+    values = os.environ if env is None else env
+    public_key = values.get("FF_AUTH_PUBLIC_KEY", "").replace("\\n", "\n").strip()
+    jwks_uri = values.get("FF_AUTH_JWKS_URI", "").strip()
+    issuer = values.get("FF_AUTH_ISSUER", "").strip()
+    audience = values.get("FF_AUTH_AUDIENCE", "").strip()
+    base_url = values.get("FF_AUTH_BASE_URL", "").strip()
+
+    configured = any((public_key, jwks_uri, issuer, audience, base_url))
+    if not configured:
+        return None
+    if bool(public_key) == bool(jwks_uri):
+        raise RuntimeError(
+            "Configure exactly one of FF_AUTH_PUBLIC_KEY or FF_AUTH_JWKS_URI."
+        )
+    if not issuer or not audience or not base_url:
+        raise RuntimeError(
+            "FF_AUTH_ISSUER, FF_AUTH_AUDIENCE, and FF_AUTH_BASE_URL are required "
+            "when MCP authentication is configured."
+        )
+
+    return JWTVerifier(
+        public_key=public_key or None,
+        jwks_uri=jwks_uri or None,
+        issuer=issuer,
+        audience=audience,
+        algorithm=values.get("FF_AUTH_ALGORITHM", "RS256").strip() or "RS256",
+        required_scopes=[READ_SCOPE],
+        base_url=base_url,
+    )
+
+
+AUTH_PROVIDER = _build_auth_provider()
+
+
+def _require_scope(scope: str) -> None:
+    """Enforce caller allow-list and per-tool authorization."""
+
+    # Local-only development is protected by the loopback network boundary.
+    # Public startup separately refuses to run unless AUTH_PROVIDER is set.
+    if AUTH_PROVIDER is None:
+        return
+
+    token = get_access_token()
+    if token is None:
+        raise PermissionError("An authenticated MCP caller is required.")
+
+    allowed_clients = set(_split_csv(os.getenv("FF_AUTH_ALLOWED_CLIENT_IDS")))
+    if not allowed_clients:
+        raise PermissionError("No MCP caller allow-list is configured.")
+    if token.client_id not in allowed_clients:
+        raise PermissionError("This MCP caller is not authorized.")
+    if scope not in set(token.scopes):
+        raise PermissionError(f"The MCP caller is missing the required {scope!r} scope.")
+
 server = FastMCP(
     name="fantasy-football",
     instructions=(
@@ -31,6 +104,7 @@ server = FastMCP(
         "analysis, waiver insights, draft tools, and Reddit sentiment checks. "
         "Set the YAHOO_* environment variables before starting the server."
     ),
+    auth=AUTH_PROVIDER,
 )
 
 _TOOL_PROMPTS: Dict[str, str] = {
@@ -122,6 +196,8 @@ async def _call_legacy_tool(
     **arguments: Any,
 ) -> Dict[str, Any]:
     """Delegate to the legacy MCP tool implementation and parse its JSON payload."""
+
+    _require_scope(READ_SCOPE)
 
     filtered_args = {key: value for key, value in arguments.items() if value is not None}
 
@@ -543,6 +619,7 @@ async def ff_refresh_token(ctx: Context) -> Dict[str, Any]:
     Returns:
         Dict with token refresh status
     """
+    _require_scope(ADMIN_SCOPE)
     if ctx is not None:
         await ctx.info("Refreshing Yahoo OAuth token")
     return await _legacy_refresh_token()
@@ -581,6 +658,7 @@ async def ff_clear_cache(
     ctx: Context,
     pattern: Optional[str] = None,
 ) -> Dict[str, Any]:
+    _require_scope(ADMIN_SCOPE)
     return await _call_legacy_tool("ff_clear_cache", ctx=ctx, pattern=pattern)
 
 
@@ -1676,8 +1754,22 @@ def run_http_server(
 ) -> None:
     """Start the FastMCP server using the HTTP transport."""
 
-    resolved_host = host or os.getenv("HOST", "0.0.0.0")
+    resolved_host = host or os.getenv("HOST", "127.0.0.1")
     resolved_port = port or int(os.getenv("PORT", "8000"))
+
+    if resolved_host not in {"127.0.0.1", "::1", "localhost"}:
+        if os.getenv("FF_ALLOW_PUBLIC_HTTP") != "1":
+            raise RuntimeError(
+                "Refusing a non-local HTTP listener without FF_ALLOW_PUBLIC_HTTP=1."
+            )
+        if AUTH_PROVIDER is None:
+            raise RuntimeError(
+                "Refusing a public HTTP listener without JWT authentication."
+            )
+        if not _split_csv(os.getenv("FF_AUTH_ALLOWED_CLIENT_IDS")):
+            raise RuntimeError(
+                "Refusing a public HTTP listener without FF_AUTH_ALLOWED_CLIENT_IDS."
+            )
 
     server.run(
         "http",

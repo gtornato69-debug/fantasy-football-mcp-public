@@ -10,13 +10,21 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.0
       - key: DEBUG
-        value: true
-      - key: ALLOWED_REDIRECT_URIS
-        value: "https://claude.ai/api/mcp/auth_callback,https://claude.ai/oauth/callback,https://claude.ai/*"
-      - key: ALLOWED_CLIENT_IDS
-        value: "Claude,claude-ai,claude.ai,anthropic,mcp-client,*"
-      - key: OAUTH_CLIENT_SECRET
-        generateValue: true
+        value: false
+      - key: HOST
+        value: 0.0.0.0
+      - key: FF_ALLOW_PUBLIC_HTTP
+        value: "1"
+      - key: FF_AUTH_JWKS_URI
+        sync: false
+      - key: FF_AUTH_ISSUER
+        sync: false
+      - key: FF_AUTH_AUDIENCE
+        sync: false
+      - key: FF_AUTH_BASE_URL
+        sync: false
+      - key: FF_AUTH_ALLOWED_CLIENT_IDS
+        sync: false
       - key: YAHOO_CLIENT_ID
         sync: false
       - key: YAHOO_CLIENT_SECRET
